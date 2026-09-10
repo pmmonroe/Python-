@@ -1,0 +1,150 @@
+import os
+import json
+import re
+from datetime import datetime
+from typing import Dict, Any, List
+
+import requests
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+METASTORE_URL = "https://data.cms.gov/provider-data/api/1/metastore/schemas/dataset/items"
+OUTPUT_DIR = "output_hospitals"
+METADATA_FILE = "run_metadata.json"
+
+DATE_FORMAT = "%Y-%m-%d"
+
+
+def load_metadata() -> Dict[str, Any]:
+    if not os.path.exists(METADATA_FILE):
+        return {}
+    with open(METADATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_metadata(metadata: Dict[str, Any]) -> None:
+    with open(METADATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def to_snake_case(col: str) -> str:
+    s = col.lower()
+    s = re.sub(r"[^0-9a-z]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_")
+
+
+def fetch_metastore() -> List[Dict[str, Any]]:
+    resp = requests.get(METASTORE_URL, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def filter_hospital_datasets(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        item for item in items
+        if any(t.lower() == "hospitals" for t in item.get("theme", []))
+    ]
+
+
+def should_download(item: Dict[str, Any], metadata: Dict[str, Any]) -> bool:
+    identifier = item.get("identifier")
+    modified_str = item.get("modified")
+
+    if not identifier or not modified_str:
+        return True
+
+    try:
+        modified_dt = datetime.strptime(modified_str[:10], DATE_FORMAT)
+    except ValueError:
+        return True
+
+    last_meta = metadata.get(identifier, {})
+    last_modified_str = last_meta.get("last_modified")
+
+    if not last_modified_str:
+        return True
+
+    try:
+        last_modified_dt = datetime.strptime(last_modified_str[:10], DATE_FORMAT)
+    except ValueError:
+        return True
+
+    return modified_dt > last_modified_dt
+
+
+def process_dataset(item: Dict[str, Any], metadata: Dict[str, Any]) -> None:
+    identifier = item.get("identifier", "unknown_id")
+    title = item.get("title", "unknown_title")
+    modified_str = item.get("modified", "")
+
+    distributions = item.get("distribution", [])
+    if not distributions:
+        print(f"[SKIP] {identifier} - no distributions")
+        return
+
+    download_url = distributions[0].get("downloadURL")
+    if not download_url:
+        print(f"[SKIP] {identifier} - no downloadURL")
+        return
+
+    print(f"[DOWNLOAD] {identifier} - {title}")
+    resp = requests.get(download_url, timeout=60)
+    resp.raise_for_status()
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    df = pd.read_csv(pd.compat.StringIO(resp.text))
+    df.columns = [to_snake_case(c) for c in df.columns]
+
+    safe_title = re.sub(r"[^0-9a-zA-Z]+", "_", title).strip("_")
+    filename = f"{identifier}_{safe_title}.csv"
+    output_path = os.path.join(OUTPUT_DIR, filename)
+
+    df.to_csv(output_path, index=False)
+    print(f"[SAVED] {output_path}")
+
+    metadata[identifier] = {
+        "last_modified": modified_str,
+        "last_downloaded": datetime.utcnow().isoformat(timespec="seconds"),
+        "download_url": download_url,
+        "title": title,
+    }
+
+
+def main():
+    print("=== CMS Hospitals Job ===")
+    metadata = load_metadata()
+
+    try:
+        items = fetch_metastore()
+    except Exception as e:
+        print(f"Error fetching metastore: {e}")
+        return
+
+    hospital_items = filter_hospital_datasets(items)
+    print(f"Found {len(hospital_items)} hospital-themed datasets.")
+
+    to_download = [item for item in hospital_items if should_download(item, metadata)]
+    print(f"{len(to_download)} datasets need download based on metadata.")
+
+    if not to_download:
+        print("No new or updated datasets to download.")
+        return
+
+    with ThreadPoolExecutor(max_workers=min(8, len(to_download))) as executor:
+        futures = {executor.submit(process_dataset, item, metadata): item for item in to_download}
+        for future in as_completed(futures):
+            item = futures[future]
+            identifier = item.get("identifier", "unknown_id")
+            try:
+                future.result()
+            except Exception as e:
+                print(f"[ERROR] dataset {identifier}: {e}")
+
+    save_metadata(metadata)
+    print("Job complete. Metadata updated.")
+
+
+if __name__ == "__main__":
+    main()
